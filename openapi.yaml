@@ -1,0 +1,586 @@
+openapi: 3.0.3
+info:
+  title: Reneo Backend API
+  description: >
+    Backend API for Reneo, a multi-seller commerce platform. Sellers manage
+    their own product catalogues and inventory; customers place orders
+    across sellers. Pricing and stock are always resolved on the server —
+    clients never supply a price, and stock is decremented atomically
+    inside a single Postgres transaction (see README: Concurrency Control).
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Health
+  - name: Products
+  - name: Orders
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Supabase JWT
+      description: >
+        Supabase Auth access token (e.g. from supabase.auth.signInWithPassword),
+        sent as `Authorization: Bearer <token>`.
+
+  schemas:
+    Error:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              example: Invalid request data
+            details:
+              type: array
+              description: Present only on VALIDATION_ERROR (400) responses.
+              items:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    example: items.0.price
+                  message:
+                    type: string
+                    example: Client-side pricing not allowed
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    Product:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        category:
+          type: string
+        price_cents:
+          type: integer
+          format: int64
+          description: Price in the smallest unit of `currency`. Always an integer, never a float.
+        currency:
+          type: string
+          example: XOF
+        status:
+          type: string
+          enum: [active, archived]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        inventory:
+          type: object
+          nullable: true
+          description: Nested on list/read responses.
+          properties:
+            stock:
+              type: integer
+        stock:
+          type: integer
+          description: Present only on the create-product response (flattened, not nested).
+
+    ProductCreateInput:
+      type: object
+      required: [name, category, price_cents, stock]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 2000
+        category:
+          type: string
+          minLength: 1
+          maxLength: 100
+        price_cents:
+          type: integer
+          minimum: 0
+          exclusiveMinimum: true
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          default: XOF
+        stock:
+          type: integer
+          minimum: 0
+          description: Initial inventory; creates the associated inventory row.
+
+    ProductUpdateInput:
+      type: object
+      description: Partial update — at least one field is required.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 2000
+        category:
+          type: string
+          minLength: 1
+          maxLength: 100
+        price_cents:
+          type: integer
+          minimum: 0
+          exclusiveMinimum: true
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+
+    Pagination:
+      type: object
+      properties:
+        limit:
+          type: integer
+        nextCursor:
+          type: string
+          nullable: true
+          description: >
+            Opaque base64url cursor. Pass as `?cursor=` to fetch the next
+            page; null once there are no more results.
+
+    OrderItemInput:
+      type: object
+      required: [product_id, quantity]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 0
+          exclusiveMinimum: true
+      description: >
+        Only product_id and quantity are accepted. An item containing
+        price, unit_price, or total is rejected with 400 VALIDATION_ERROR
+        ("Client-side pricing not allowed") — the server always resolves
+        price itself.
+
+    OrderCreateInput:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItemInput'
+
+    OrderItem:
+      type: object
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        seller_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+        unit_price_cents:
+          type: integer
+          format: int64
+          description: Server-resolved price snapshot at order time.
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [confirmed]
+        total_cents:
+          type: integer
+          format: int64
+        currency:
+          type: string
+          example: XOF
+        created_at:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+
+  parameters:
+    ProductId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+      description: >
+        Optional client-generated key. Replaying the same key with the same
+        payload returns the original 201 response without creating a
+        second order. Replaying it with a different payload returns 409
+        (IDEMPOTENCY_KEY_CONFLICT).
+
+  responses:
+    BadRequest:
+      description: Invalid input.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated, but not permitted to perform this action.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource does not exist, or is not visible to the caller.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServerError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /products:
+    get:
+      tags: [Products]
+      summary: Search active products (public catalogue)
+      operationId: listProducts
+      security: []
+      description: >
+        Full-text search, category/price/availability filters, and keyset
+        pagination over active listings. No authentication required.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor from a previous response's pagination.nextCursor.
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Full-text search over name + description (websearch_to_tsquery syntax).
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: min_price
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+        - name: max_price
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+        - name: in_stock
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+      responses:
+        '200':
+          description: A page of active products.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Product'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+    post:
+      tags: [Products]
+      summary: Create a product (seller)
+      operationId: createProduct
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductCreateInput'
+      responses:
+        '201':
+          description: Product created, with its inventory row.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Caller is a SELLER with no store yet (NO_STORE).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /products/{id}:
+    get:
+      tags: [Products]
+      summary: Read one active product
+      operationId: getProductById
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: The product.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+    patch:
+      tags: [Products]
+      summary: Update a product (owning seller only)
+      operationId: updateProduct
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductUpdateInput'
+      responses:
+        '200':
+          description: Updated product.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Authenticated seller does not own this product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+    delete:
+      tags: [Products]
+      summary: Archive a product (owning seller only)
+      operationId: archiveProduct
+      description: >
+        Soft delete: sets status to 'archived'. Never a hard delete —
+        order_items.product_id is ON DELETE RESTRICT, so a product with
+        order history could not be physically removed anyway; archiving is
+        the one behavior that works for every product.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: Product archived.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Product'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Authenticated seller does not own this product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /orders:
+    post:
+      tags: [Orders]
+      summary: Create an order (customer)
+      operationId: createOrder
+      description: >
+        Price, seller, and stock are all resolved server-side inside a
+        single Postgres transaction (the create_order function — see
+        supabase/migrations). Stock is decremented atomically per item; if
+        any item is unavailable, the whole order is rolled back and 409 is
+        returned. The request body must not include price, unit_price, or
+        total for any item.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateInput'
+      responses:
+        '201':
+          description: Order created (or, on an idempotent replay, the original order).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid input, including client-supplied pricing fields.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: A referenced product does not exist or is not active.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: >
+            Insufficient stock for an item (INSUFFICIENT_STOCK), or the
+            Idempotency-Key was reused with a different payload
+            (IDEMPOTENCY_KEY_CONFLICT).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/ServerError'
